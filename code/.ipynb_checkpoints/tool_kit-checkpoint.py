@@ -25,10 +25,10 @@ def accuracy_plot(y_test, y_pred, title_text, show_range = [0, 6.2]):
     fig = plt.figure(figsize=(8, 8))
     fig.suptitle(title_text, fontsize=20, fontweight='bold')
     plt.title(f'R2={r2:.2f}, RMSE={rmse:.4f}, CCC={ccc:.2f}')
-    plt.hexbin(y_test, y_pred, gridsize=(300, 300), cmap='plasma_r', mincnt=1, vmax=30)
+    plt.hexbin(y_pred, y_test, gridsize=(300, 300), cmap='plasma_r', mincnt=1, vmax=30)
     
-    plt.xlabel('SOC - test')
-    plt.ylabel('SOC - pred')
+    plt.xlabel('SOC - pred')
+    plt.ylabel('SOC - true')
     
     ax = plt.gca()
     ax.set_aspect('auto', adjustable='box')
@@ -41,3 +41,41 @@ def accuracy_plot(y_test, y_pred, title_text, show_range = [0, 6.2]):
     cb = plt.colorbar(cax=cax)
     
     plt.show()
+    
+# def clean_prop(df, prop, limit):
+#     print(f'\033[1mCleaning {prop}\033[0m')
+#     tot = len(df)
+#     print(f'originally with {tot} rows')
+#     # Clean NaN
+#     num = df[prop].isna().sum()
+#     ccol = df.loc[df[prop].isna()]['ref'].unique()
+#     print(f'{num} ({num/tot*100:.2f}%) rows with NaN, from {ccol}')
+#     df = df.dropna(subset=[prop])
+    
+#     # check if there are string values that cannot be converted to numerical values,
+#     # usually it's <LOD (limit of detection), such as '<6', '<LOD', etc
+# #     df.loc[:,prop] = pd.to_numeric(df.loc[:,prop], errors='coerce')
+#     df[prop] = pd.to_numeric(df[prop], errors='coerce')
+#     num = df[prop].isna().sum()
+#     ccol = df.loc[df[prop].isna()]['ref'].unique()
+#     print(f'{num} ({num/tot*100:.2f}%) rows with invalid strings, from {ccol}')
+#     df = df.dropna(subset=[prop])
+    
+#     # Check for values below 0, which are invalid for all properties
+#     num = len(df.loc[df[prop] < 0])
+#     ccol = df.loc[df[prop] < 0]['ref'].unique()
+#     print(f'{num} ({num/tot*100:.2f}%) rows with {prop} < 0, from {ccol}')
+#     df = df[df[prop] >= 0]
+    
+#     # check for values higher than plausible limit
+#     if limit:
+#         num = len(df.loc[df[prop]>limit])
+#         ccol = df.loc[df[prop]>limit]['ref'].unique()
+#         print(f'{num} ({num/tot*100:.2f}%) rows with {prop} > limit values, from {ccol}')
+#         df = df[df[prop] < limit]
+    
+#     print(f'{len(df)} valid data records left')
+#     return df
+
+
+# dff = clean_prop(df,'oc',1000)

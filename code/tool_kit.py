@@ -25,10 +25,10 @@ def accuracy_plot(y_test, y_pred, title_text, show_range = [0, 6.2]):
     fig = plt.figure(figsize=(8, 8))
     fig.suptitle(title_text, fontsize=20, fontweight='bold')
     plt.title(f'R2={r2:.2f}, RMSE={rmse:.4f}, CCC={ccc:.2f}')
-    plt.hexbin(y_test, y_pred, gridsize=(300, 300), cmap='plasma_r', mincnt=1, vmax=30)
+    plt.hexbin(y_pred, y_test, gridsize=(300, 300), cmap='plasma_r', mincnt=1, vmax=30)
     
-    plt.xlabel('SOC - test')
-    plt.ylabel('SOC - pred')
+    plt.xlabel('SOC - pred')
+    plt.ylabel('SOC - true')
     
     ax = plt.gca()
     ax.set_aspect('auto', adjustable='box')
