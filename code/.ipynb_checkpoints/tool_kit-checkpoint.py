@@ -77,7 +77,7 @@ def sorted_plot(y_test, y_pred, title):
     # Plot
     plt.figure(figsize=(12, 6))
     plt.plot(range(len(sorted_y_test)), sorted_y_pred, 'or', label='Predicted Values')
-    plt.plot(range(len(sorted_y_test)), sorted_y_test, 'k-', label='True Values', alpha=0.7)
+    plt.plot(range(len(sorted_y_test)), sorted_y_test, 'k-', label='True Values', alpha=0.4)
 
     # Formatting
     plt.title(f'check end values of {title}')
