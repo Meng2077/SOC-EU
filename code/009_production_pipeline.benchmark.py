@@ -478,12 +478,6 @@ def run_benchmark(folder,output_folder,space,prop,filt,test_size=0):
     results.to_csv(f'{output_folder}/benchmark_metrics_{prop}.csv',index=False)
         
 
-    
-    
- 
-     
-
-
 
     
 
