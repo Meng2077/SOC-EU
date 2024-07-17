@@ -67,12 +67,34 @@ def run_rankcv(data, covs, tgt, spatial_cv_column, weights_feature=None, n_boots
         importances = importances[importances>=importances.mean()]
         runs.append((importances.index, np.array(importances.to_list())))
         
-    result = pd.DataFrame(
+    result_rankcv = pd.DataFrame(
         dict(feature=[feature for run in runs for feature in run[0]], 
              importance=[importance for run in runs for importance in run[1]])
     )
+    
+    feature_list = result_rankcv.groupby(['feature']).count().rename(columns=dict(importance='freq')).reset_index()
+    features_freq = feature_list.groupby('freq').count().reset_index().sort_values(by='freq', ascending=False)
+    # features_freq['accum'] = features_freq['feature'].cumsum()
+    # knee_index = find_knee(features_freq)
+    # knee_freq = features_freq.loc[knee_index]['freq']
+    # minf = features_freq.loc[features_freq['feature']==features_freq['feature'].min(),'freq'].values[0]
+    minv = 15
+    covs = feature_list[feature_list['freq']>=minv]['feature'].tolist() # choose only those with high frequency
+    feature_list.to_csv(f'{output_folder}/benchmark_rank.freq.covs_{prop}.csv',index=False)
+    while len(covs)>90 and minv<20:
+        minv = minv+1
+        covs = feature_list[feature_list['freq']>=minv]['feature'].tolist()
+    if 'hzn_dep' not in covs:
+        covs.append('hzn_dep')
 
-    return result
+    print(f'--------------{len(covs)} features selected for {prop}, threshold: {minv}---------')
+
+    # Save the final list of features for records
+    with open(f'{output_folder}/benchmark_selected.covs_{prop}.txt', 'w') as file:
+        for item in covs:
+            file.write(f"{item}\n")
+            
+    return covs
 
 def calc_ccc(y_true, y_pred):
     if len(y_true) <= 1 or len(y_pred) <= 1:
@@ -177,82 +199,142 @@ def sorted_plot(y_test, y_pred, title, output_folder):
     plt.tight_layout()
     plt.savefig(f'{output_folder}/plot_sorted_{title}.pdf', format='pdf', dpi=300)
     
+def calc_metrics(y_true, y_pred):
+    ccc = calc_ccc(y_true, y_pred)
+    rmse = mean_squared_error(y_true, y_pred, squared=False)
+    r2 = r2_score(y_true, y_pred)
+    return ccc, rmse, r2
 
-def run_benchmark(folder,output_folder,space,prop,filt,test_size=0):
-    df = pd.read_csv(f'/mnt/primus/xuemeng_tmp_harbour/soc/data/002_data_whole.csv',low_memory=False)
-    os.makedirs(output_folder, exist_ok=True)
+
+def run_cumusort(data, tgt, prop, output_folder, weights_feature=None, threshold_step=0.001):
+    covs_all = read_features(f'/home/opengeohub/xuemeng/work_xuemeng/soc/SOC-EU/features/001_covar_all.txt')
+    data = data.dropna(subset=covs_all,how='any')
+    n_bootstrap=20
+    ntrees = 100
     
-    ### data set preparation
-    # clean the data according to each properties
-    df = df.loc[df[prop].notna()]
-    df = df.loc[df[f'{prop}_qa']>filt]
-    df[prop].hist(bins=40)
+    spatial_cv_column='tile_id'
+    groups = data[spatial_cv_column].unique()
+    runs = []
+    feature_importances = []
     
-    # set target variable
-    if space=='log1p':
-        df.loc[:,f'{prop}_log1p'] = np.log1p(df[prop])
-        tgt = f'{prop}_log1p'
-    else:
-        tgt = prop
+    print(f'start bootstrap on different subset...')
+    for k in range(n_bootstrap):
+        
+        np.random.seed(k)
+        selected_groups = np.random.choice(groups, int(len(groups) * 0.7), False)  # each time cover 70% of the tiles
+        train = data[data[spatial_cv_column].isin(selected_groups)]
+        # train = train.groupby(spatial_cv_column, group_keys=False).apply(lambda x: x.sample(min(len(x), 5)))  # make sure to select enough data for training
+        
+        ttprint(f'{k} iteration, training size: {len(train)}')
+        # Get weights if applicable
+        if weights_feature:
+            weights = train[weights_feature].to_numpy()
+            rf = RandomForestRegressor(random_state=41, n_jobs=80, n_estimators=ntrees)
+            rf.fit(train[covs_all], train[tgt], sample_weight=weights)
+        else:
+            rf = RandomForestRegressor(random_state=41, n_jobs=80, n_estimators=ntrees)
+            rf.fit(train[covs_all], train[tgt])
             
-    # split calibration, train and test for benchmark
-    bd_val = pd.read_csv(f'/mnt/primus/xuemeng_tmp_harbour/soc/data/003.0_validate.pnts.rob_bd.csv',low_memory=False)
-    oc_val = pd.read_csv(f'/mnt/primus/xuemeng_tmp_harbour/soc/data/003.1_validate.pnts.rob_soc.csv',low_memory=False)
-    idl = bd_val['id'].values.tolist() + oc_val['id'].values.tolist()
-    idl = [str(i) for i in idl]
-    test = df.loc[df['id'].isin(idl)] # individual test datasets
-    cal_train = df.loc[~df['id'].isin(idl)] # calibration and train
-    # get 10% of training data as calibration for parameter fine tuning and feature selection
-    cal_train.reset_index(drop=True, inplace=True)
-    cal = cal_train.groupby('tile_id', group_keys=False).apply(lambda x: x.sample(n=max(1, int(np.ceil(0.2 * len(x))))))
-    # the rest as training dataset
-    train = cal_train.drop(cal.index)
-    # if test_size>0:
-    #     test = test.iloc[0:round(len(test)*test_size)]
-    #     train = train.iloc[0:round(len(train)*test_size)]
-    #     cal = cal.iloc[0:round(len(cal)*test_size)]
-    cal.to_csv(f'{output_folder}/benchmark_cal.pnts_{prop}.csv',index=False)
-    train.to_csv(f'{output_folder}/benchmark_train.pnts_{prop}.csv',index=False)
-    test.to_csv(f'{output_folder}/benchmark_test.pnts_{prop}.csv',index=False)
+        feature_importances.append(rf.feature_importances_)
+        
+    result = pd.DataFrame(feature_importances, columns=covs_all)
+        
     
-    ### feature selection
-    ccc_scorer = make_scorer(calc_ccc, greater_is_better=True)
-    covs_all = read_features(f'/mnt/primus/xuemeng_tmp_harbour/soc/SOC-EU/features/001_covar_all.txt')
-    cal = cal.dropna(subset=covs_all,how='any')
+    sorted_importances = result.mean(axis=0).sort_values(ascending=False)
+    sorted_importances = sorted_importances.reset_index()
+    sorted_importances.columns = ['Feature Name', 'Mean Cumulative Feature Importance']
+    sorted_importances.to_csv(f'{output_folder}/cumulative.feature.importance_{prop}.csv',index=False)
+    
+    max_threshold = sorted_importances['Mean Cumulative Feature Importance'].max()
+    thresholds = np.arange(0, max_threshold + threshold_step, threshold_step)
+    previous_feature_set = set([])
+    n_splits = 5
+    results = [] # store the results
+    
+    print(f'start feature elimination evaluation...')
+    for threshold in thresholds:
+        current_features_df = sorted_importances[sorted_importances['Mean Cumulative Feature Importance'] >= threshold]
+        current_features = current_features_df['Feature Name'].tolist()
+        
+        if set(current_features) == previous_feature_set:
+            continue  # Skip if feature set doesn't change
+        previous_feature_set = set(current_features)
 
-    result_rankcv = run_rankcv(cal, covs_all, tgt, spatial_cv_column='tile_id')
-    feature_list = result_rankcv.groupby(['feature']).count().rename(columns=dict(importance='freq')).reset_index()
-    features_freq = feature_list.groupby('freq').count().reset_index().sort_values(by='freq', ascending=False)
-    # features_freq['accum'] = features_freq['feature'].cumsum()
-    # knee_index = find_knee(features_freq)
-    # knee_freq = features_freq.loc[knee_index]['freq']
-    # minf = features_freq.loc[features_freq['feature']==features_freq['feature'].min(),'freq'].values[0]
-    minv = 15
-    covs = feature_list[feature_list['freq']>=minv]['feature'].tolist() # choose only those with high frequency
-    feature_list.to_csv(f'{output_folder}/benchmark_rank.freq.covs_{prop}.csv',index=False)
-    while len(covs)>90 and minv<20:
-        minv = minv+1
-        covs = feature_list[feature_list['freq']>=minv]['feature'].tolist()
+        if len(current_features)<2:
+            break  # Stop if limited (<2) features are left
+
+        ttprint(f'processing {threshold} ...')
+        rf = RandomForestRegressor(random_state=41, n_jobs=80, n_estimators=ntrees)
+        group_kfold = GroupKFold(n_splits=n_splits)
+
+        groups = data[spatial_cv_column].values
+        y_pred = cross_val_predict(rf, data[current_features], data[tgt], cv=group_kfold, groups=groups, n_jobs=-1)
+        y_true = data[tgt]
+
+        metrics = calc_metrics(y_true, y_pred)
+        results.append((threshold, len(current_features), *metrics))
+    
+    results_df = pd.DataFrame(results, columns=['Threshold', 'Num_Features', 'CCC', 'RMSE', 'R2'])
+
+    # plot feature elimination analysis
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    color = 'tab:blue'
+    ax1.set_xlabel('Feature Importance Threshold', fontsize=16)
+    ax1.set_ylabel('Number of Features', color=color, fontsize=16)
+    ax1.plot(results_df['Threshold'], results_df['Num_Features'], color=color, marker='o', label='Num_Features')
+    ax1.tick_params(axis='y', labelcolor=color, labelsize=14)
+    ax1.tick_params(axis='x', labelsize=14)
+    ax2 = ax1.twinx()
+    color = 'tab:red'
+    ax2.set_ylabel('Evaluation Metrics', color=color, fontsize=16)
+    ax2.plot(results_df['Threshold'], results_df['CCC'], color='tab:green', marker='x', label='CCC')
+    ax2.plot(results_df['Threshold'], results_df['RMSE'], color='tab:orange', marker='^', label='RMSE')
+    ax2.plot(results_df['Threshold'], results_df['R2'], color='tab:red', marker='s', label='R2')
+    ax2.tick_params(axis='y', labelcolor=color, labelsize=14)
+    fig.tight_layout() 
+    ax1.legend(loc='upper left', fontsize=14)
+    ax2.legend(loc='upper right', fontsize=14)
+    plt.title('Feature Elimination Analysis', fontsize=16)
+    plt.savefig(f'{output_folder}/plot_feature.elimination_{prop}.pdf')
+    plt.show()
+    
+    results_df['CCC_Rank'] = results_df['CCC'].rank(ascending=False)
+    results_df['RMSE_Rank'] = results_df['RMSE'].rank(ascending=True)
+    results_df['R2_Rank'] = results_df['R2'].rank(ascending=False)
+    results_df['Combined_Rank'] = results_df['CCC_Rank'] + results_df['RMSE_Rank'] + results_df['R2_Rank']
+    results_df = results_df.sort_values(by='Combined_Rank')
+    results_df.to_csv(f'{output_folder}/metrics.rank_feature.elimination_{prop}.csv', index=False)
+    best_threshold = None
+
+    for index, row in results_df.iterrows():
+        if row['Num_Features'] < 100:
+            best_threshold = row['Threshold']
+            break
+
+    features_df = sorted_importances[sorted_importances['Mean Cumulative Feature Importance'] >= best_threshold]
+    covs = features_df['Feature Name'].tolist()
     if 'hzn_dep' not in covs:
         covs.append('hzn_dep')
-
-    print(f'--------------{len(covs)} features selected for {prop}, threshold: {minv}---------')
-
-    # Save the final list of features for records
+    print(f'--------------{len(covs)} features selected for {prop}, mean cumulative feature importance threshold: {best_threshold}---------')
     with open(f'{output_folder}/benchmark_selected.covs_{prop}.txt', 'w') as file:
         for item in covs:
             file.write(f"{item}\n")
-            
+    return covs
+
+    
+def parameter_fine_tuning(cal, covs, tgt, prop, output_folder):
     models = [] #[rf, ann, lgb, rf_weighted, lgb_weighted] #cubist, cubist_weighted, 
     model_names = [] #['rf', 'ann', 'lgb', 'rf_weighted', 'lgb_weighted'] # 'cubist',, 'cubist_weighted'
-
+    cal = cal.dropna(subset=covs,how='any')
 
     ### parameter fine tuning
     spatial_cv_column = 'tile_id'
     cv = GroupKFold(n_splits=5)
+    ccc_scorer = make_scorer(calc_ccc, greater_is_better=True)
     fitting_score = ccc_scorer
     ## no weights version
     # random forest
+    ttprint('----------------------rf------------------------')
     param_rf = {
         'n_estimators': [60, 80, 100],
         "criterion": [ 'squared_error', 'absolute_error', 'poisson', 'friedman_mse'],
@@ -261,7 +343,6 @@ def run_benchmark(folder,output_folder,space,prop,filt,test_size=0):
         'min_samples_split': [2, 5, 10],
         'min_samples_leaf': [1, 2, 4]
     }
-
     tune_rf = HalvingGridSearchCV(
         estimator=RandomForestRegressor(),
         param_grid=param_rf,
@@ -271,99 +352,103 @@ def run_benchmark(folder,output_folder,space,prop,filt,test_size=0):
         verbose=1,
         random_state = 1992
     )
-
     tune_rf.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
     warnings.filterwarnings('ignore')
     rf = tune_rf.best_estimator_
-    joblib.dump(rf, f'{output_folder}/model_rf.{prop}_{space}.ccc.joblib')
+    joblib.dump(rf, f'{output_folder}/model_rf.{prop}_ccc.joblib')
     models.append(rf)
     model_names.append('rf')
 
-    # simple ANN
-    warnings.filterwarnings('ignore')
-    pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('mlp', MLPRegressor(max_iter=5000, early_stopping=True, random_state=28))
-    ])
-    param_ann = {
-        'mlp__hidden_layer_sizes': [(50,), (100,), (100, 50), (100, 100)],  # NN structure
-        'mlp__activation': ['tanh', 'relu', 'logistic'],  # commonly used activation functions in NN
-        'mlp__solver': ['sgd','adam'],  # optimizer set as sgd
-        'mlp__alpha': [0.0001, 0.001, 0.01],  # regularization to prevent overfitting
-        'mlp__learning_rate': ['constant', 'adaptive'],  # how aggressive the weights update
-        'mlp__learning_rate_init': [0.001, 0.01]  # initial learning rate
+#     # simple ANN
+#     ttprint('----------------------ann------------------------')
+#     warnings.filterwarnings('ignore')
+#     pipeline = Pipeline([
+#         ('scaler', StandardScaler()),
+#         ('mlp', MLPRegressor(max_iter=5000, early_stopping=True, random_state=28))
+#     ])
+#     param_ann = {
+#         'mlp__hidden_layer_sizes': [(50,), (100,), (100, 50), (100, 100)],  # NN structure
+#         'mlp__activation': ['tanh', 'relu', 'logistic'],  # commonly used activation functions in NN
+#         'mlp__solver': ['sgd','adam'],  # optimizer set as sgd
+#         'mlp__alpha': [0.0001, 0.001, 0.01],  # regularization to prevent overfitting
+#         'mlp__learning_rate': ['constant', 'adaptive'],  # how aggressive the weights update
+#         'mlp__learning_rate_init': [0.001, 0.01]  # initial learning rate
         
-    }
+#     }
+#     tune_ann = HalvingGridSearchCV(
+#         estimator=pipeline,
+#         param_grid=param_ann,
+#         scoring=fitting_score,
+#         n_jobs=90,
+#         cv=cv,
+#         verbose=1,
+#         random_state=1993
+#     )
+#     tune_ann.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
+#     ann = tune_ann.best_estimator_
+#     joblib.dump(ann, f'{output_folder}/model_ann.{prop}_ccc.joblib')
+#     models.append(ann)
+#     model_names.append('ann')
 
-    tune_ann = HalvingGridSearchCV(
-        estimator=pipeline,
-        param_grid=param_ann,
-        scoring=fitting_score,
-        n_jobs=90,
-        cv=cv,
-        verbose=1,
-        random_state=1993
-    )
-    tune_ann.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
-    ann = tune_ann.best_estimator_
-    joblib.dump(ann, f'{output_folder}/model_ann.{prop}_{space}.ccc.joblib')
-    models.append(ann)
-    model_names.append('ann')
-
-    # # lightGBR
-    import lightgbm as lgb
-    def clean_feature_names(df):
-        df.columns = [col.replace('{', '').replace('}', '').replace(':', '').replace(',', '').replace('"', '') for col in df.columns]
-        return df
-    from sklearn.preprocessing import FunctionTransformer
-    clean_names_transformer = FunctionTransformer(clean_feature_names, validate=False)
-    pipeline = Pipeline([
-        ('clean_names', clean_names_transformer),  # Clean feature names
-        ('lgbm', lgb.LGBMRegressor(random_state=35,verbose=-1))         # Replace with any model you intend to use
-    ])
-    param_lgb = {
-        'lgbm__n_estimators': [80, 100, 120],  # Lower initial values for quicker testing
-        'lgbm__max_depth': [3, 5, 7],  # Lower maximum depths
-        'lgbm__num_leaves': [20, 31, 40],  # Significantly fewer leaves
-        'lgbm__learning_rate': [0.01, 0.05, 0.1],  # Fine as is, covers a good range
-        'lgbm__min_child_samples': [20, 30, 50],  # Much lower values to accommodate small data sets
-        'lgbm__subsample': [0.8, 1.0],  # Reduced range, focusing on higher subsampling
-        'lgbm__colsample_bytree': [0.8, 1.0],  # Less variation, focus on higher values
-        'lgbm__verbosity': [-1]
-    }
-
-    tune_lgb = HalvingGridSearchCV(
-        estimator=pipeline,
-        param_grid=param_lgb,
-        scoring=fitting_score,
-        n_jobs=90,
-        cv=cv,
-        verbose=1,
-        random_state=1994
-    )
-
-    tune_lgb.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
-    lgbmd = tune_lgb.best_estimator_
-    joblib.dump(lgbmd, f'{output_folder}/model_lgb.{prop}_{space}.ccc.joblib')
-    models.append(lgbmd)
-    model_names.append('lgb')
+    # # # lightGBR
+    # import lightgbm as lgb
+    # ttprint('----------------------lightGBM------------------------')
+    # def clean_feature_names(df):
+    #     df.columns = [col.replace('{', '').replace('}', '').replace(':', '').replace(',', '').replace('"', '') for col in df.columns]
+    #     return df
+    # from sklearn.preprocessing import FunctionTransformer
+    # clean_names_transformer = FunctionTransformer(clean_feature_names, validate=False)
+    # pipeline = Pipeline([
+    #     ('clean_names', clean_names_transformer),  # Clean feature names
+    #     ('lgbm', lgb.LGBMRegressor(random_state=35,verbose=-1))         # Replace with any model you intend to use
+    # ])
+    # param_lgb = {
+    #     'lgbm__n_estimators': [80, 100, 120],  # Lower initial values for quicker testing
+    #     'lgbm__max_depth': [3, 5, 7],  # Lower maximum depths
+    #     'lgbm__num_leaves': [20, 31, 40],  # Significantly fewer leaves
+    #     'lgbm__learning_rate': [0.01, 0.05, 0.1],  # Fine as is, covers a good range
+    #     'lgbm__min_child_samples': [20, 30, 50],  # Much lower values to accommodate small data sets
+    #     'lgbm__subsample': [0.8, 1.0],  # Reduced range, focusing on higher subsampling
+    #     'lgbm__colsample_bytree': [0.8, 1.0],  # Less variation, focus on higher values
+    #     'lgbm__verbosity': [-1]
+    # }
+    # tune_lgb = HalvingGridSearchCV(
+    #     estimator=pipeline,
+    #     param_grid=param_lgb,
+    #     scoring=fitting_score,
+    #     n_jobs=90,
+    #     cv=cv,
+    #     verbose=1,
+    #     random_state=1994
+    # )
+    # tune_lgb.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
+    # lgbmd = tune_lgb.best_estimator_
+    # joblib.dump(lgbmd, f'{output_folder}/model_lgb.{prop}_ccc.joblib')
+    # models.append(lgbmd)
+    # model_names.append('lgb')
     
-    ## weighted version
+    # ## weighted version
     sample_weights = cal[f'{prop}_qa'].values**2
+    ttprint('----------------------weighted rf------------------------')
     # random forest
     tune_rf.fit(cal[covs], cal[tgt], sample_weight=sample_weights, groups=cal[spatial_cv_column])
     rf_weighted = tune_rf.best_estimator_
-    joblib.dump(rf_weighted, f'{output_folder}/model_rf.{prop}_{space}.ccc.weighted.joblib')
+    joblib.dump(rf_weighted, f'{output_folder}/model_rf.{prop}_ccc.weighted.joblib')
     models.append(rf_weighted)
     model_names.append('rf_weighted')
-    # lightGBM
-    fit_params = {'lgbm__sample_weight': sample_weights}
-    tune_lgb.fit(cal[covs], cal[tgt], **fit_params, groups=cal[spatial_cv_column])
-    lgb_weighted = tune_lgb.best_estimator_
-    joblib.dump(lgb_weighted, f'{output_folder}/model_lgb.{prop}_{space}.ccc.weighted.joblib')
-    models.append(lgb_weighted)
-    model_names.append('lgb_weighted')
+#     # lightGBM
+#     ttprint('----------------------weighted lightGBM------------------------')
+#     fit_params = {'lgbm__sample_weight': sample_weights}
+#     tune_lgb.fit(cal[covs], cal[tgt], **fit_params, groups=cal[spatial_cv_column])
+#     lgb_weighted = tune_lgb.best_estimator_
+#     joblib.dump(lgb_weighted, f'{output_folder}/model_lgb.{prop}_ccc.weighted.joblib')
+#     models.append(lgb_weighted)
+#     model_names.append('lgb_weighted')
     
+    return models, model_names
+    
+    
+def evaluate_model(models,model_name,train,test,covs,tgt,prop):
     # cv, test
     train = train.dropna(subset=covs,how='any')
     test = test.dropna(subset=covs,how='any')
@@ -434,7 +519,67 @@ def run_benchmark(folder,output_folder,space,prop,filt,test_size=0):
           
     results = pd.DataFrame(results)
     results.to_csv(f'{output_folder}/benchmark_metrics_{prop}.csv',index=False)
-        
+    return results
+    
+def separate_data(prop, filt, space, output_folder, df): 
+    # df = pd.read_csv(f'/home/opengeohub/xuemeng/work_xuemeng/soc/data/002_data_whole.csv',low_memory=False) 
+    os.makedirs(output_folder, exist_ok=True)
+    
+    ### data set preparation
+    # clean the data according to each properties
+    df = df.loc[df[prop].notna()]
+    df = df.loc[df[f'{prop}_qa']>filt]
+    # df[prop].hist(bins=40)
+    
+    # set target variable
+    if space=='log1p':
+        df.loc[:,f'{prop}_log1p'] = np.log1p(df[prop])
+        tgt = f'{prop}_log1p'
+    else:
+        tgt = prop
+            
+    # split calibration, train and test for benchmark
+    bd_val = pd.read_csv(f'/home/opengeohub/xuemeng/work_xuemeng/soc/data/003.0_validate.pnts.rob_bd.csv',low_memory=False)
+    oc_val = pd.read_csv(f'/home/opengeohub/xuemeng/work_xuemeng/soc/data/003.1_validate.pnts.rob_soc.csv',low_memory=False)
+    idl = bd_val['id'].values.tolist() + oc_val['id'].values.tolist()
+    idl = [str(i) for i in idl]
+    test = df.loc[df['id'].isin(idl)] # individual test datasets
+    cal_train = df.loc[~df['id'].isin(idl)] # calibration and train
+    # get 10% of training data as calibration for parameter fine tuning and feature selection
+    cal_train.reset_index(drop=True, inplace=True)
+    cal = cal_train.groupby('tile_id', group_keys=False).apply(lambda x: x.sample(n=max(1, int(np.ceil(0.2 * len(x))))))
+    # the rest as training dataset
+    train = cal_train.drop(cal.index)
+    # if test_size>0:
+    #     test = test.iloc[0:round(len(test)*test_size)]
+    #     train = train.iloc[0:round(len(train)*test_size)]
+    #     cal = cal.iloc[0:round(len(cal)*test_size)]
+    cal.to_csv(f'{output_folder}/benchmark_cal.pnts_{prop}.csv',index=False)
+    train.to_csv(f'{output_folder}/benchmark_train.pnts_{prop}.csv',index=False)
+    test.to_csv(f'{output_folder}/benchmark_test.pnts_{prop}.csv',index=False)
+    return cal, train, test
+
+
+
+def run_benchmark(folder,output_folder,space,prop,filt,test_size=0):
+    cal, train, test = separate_data(prop, filt, space, output_folder)
+    
+    # # read in data
+    # cal.to_csv(f'{output_folder}/benchmark_cal.pnts_{prop}.csv',index=False)
+    # train.to_csv(f'{output_folder}/benchmark_train.pnts_{prop}.csv',index=False)
+    # test.to_csv(f'{output_folder}/benchmark_test.pnts_{prop}.csv',index=False)
+    
+    cal = pd.read_csv(f'{output_folder}/benchmark_cal.pnts_{prop}.csv',low_memory=False)
+    covs = run_cumusort(cal, tgt, prop, output_folder) #, weights_feature=None, threshold_step=0.001
+    models, model_names = parameter_fine_tuning(cal, covs, tgt, output_folder)
+    
+    
+    train = pd.read_csv(f'{output_folder}/benchmark_train.pnts_{prop}.csv',low_memory=False)
+    test = pd.read_csv(f'{output_folder}/benchmark_test.pnts_{prop}.csv',low_memory=False)
+    evaluate_model(models,model_name,train,test,covs,tgt,prop)
+    return None
+    
+
 
 
 def calc_picp(lower_bounds, upper_bounds, true_values):
