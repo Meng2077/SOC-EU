@@ -11,7 +11,8 @@ from scipy.special import expit, logit
 import warnings
 from sklearn.experimental import enable_halving_search_cv
 from sklearn.model_selection import train_test_split, cross_val_score, HalvingGridSearchCV, KFold, GroupKFold
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import RandomizedSearchCV, HalvingRandomSearchCV, cross_val_predict
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, mean_absolute_percentage_error, median_absolute_error
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.neural_network import MLPRegressor
@@ -20,14 +21,11 @@ import pickle
 from sklearn.metrics import r2_score, mean_squared_error, make_scorer
 from scipy.stats import pearsonr
 from sklearn.preprocessing import StandardScaler
-from cubist import Cubist
+# from cubist import Cubist
 from sklearn.base import BaseEstimator, TransformerMixin
 from pathlib import Path
 import os
-from sklearn.model_selection import RandomizedSearchCV
 from scipy.stats import randint, uniform
-from sklearn.model_selection import HalvingRandomSearchCV
-from sklearn.model_selection import cross_val_predict
 import math
 
 def read_features(file_path):
@@ -124,15 +122,13 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="divide by ze
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in multiply")
 
 
-def accuracy_plot(y_test, y_pred, title, output_folder, show_range=[0, 7], vmax=20):
-    r2 = r2_score(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    ccc = calc_ccc(y_test, y_pred)  # Ensure this function is defined or imported
+def accuracy_plot(y_test, y_pred, space, title, output_folder, show_range=[0, 7], vmax=20):
+    mae, mape, ccc, r2 = calc_metrics(y_test, y_pred, space)
     
     plt.rcParams.update({'font.size': 16})
     fig, ax = plt.subplots(figsize=(10, 8))  # Slightly larger figure to accommodate the colorbar
     fig.suptitle(title, fontsize=20, fontweight='bold')
-    ax.set_title(f'R2={r2:.2f}, RMSE={rmse:.2f}, CCC={ccc:.2f}')
+    ax.set_title(f'R2={r2:.2f}, MAE={mae:.2f}, CCC={ccc:.2f}')
     hb = ax.hexbin(y_test, y_pred, gridsize=(150, 150), cmap='plasma_r', mincnt=1, vmax=vmax)
     ax.set_xlabel('True')
     ax.set_ylabel('Pred')
@@ -148,7 +144,7 @@ def accuracy_plot(y_test, y_pred, title, output_folder, show_range=[0, 7], vmax=
     plt.tight_layout(rect=[0, 0, 0.92, 1])  # Adjust the right margin to make room for colorbar
     
     plt.savefig(f'{output_folder}/plot_accuracy_{title}.pdf', format='pdf', bbox_inches='tight', dpi=300)
-    return r2, rmse, ccc
+    return r2, mae, ccc
 
 def error_spatial_plot(y_test, y_pred, lat, lon, title, output_folder, latbox=[33, 72], lonbox=[-12, 35]):
     y_error = y_pred - y_test
@@ -199,14 +195,29 @@ def sorted_plot(y_test, y_pred, title, output_folder):
     plt.tight_layout()
     plt.savefig(f'{output_folder}/plot_sorted_{title}.pdf', format='pdf', dpi=300)
     
-def calc_metrics(y_true, y_pred):
-    ccc = calc_ccc(y_true, y_pred)
-    rmse = mean_squared_error(y_true, y_pred, squared=False)
-    r2 = r2_score(y_true, y_pred)
-    return ccc, rmse, r2
+def calc_metrics(y_true, y_pred, space):
+    if space == 'normal':
+        mae = mean_absolute_error(y_true, y_pred)
+        medae = median_absolute_error(y_true, y_pred)
+        mape = mean_absolute_percentage_error(y_true, y_pred)
+        bias = np.nanmean(y_pred-y_true)
+        ccc = calc_ccc(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+    else:
+        ccc = calc_ccc(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+        
+        # report MAE and MAPE in original scale
+        y_true = np.expm1(y_true)
+        y_pred = np.expm1(y_pred)
+        mae = mean_absolute_error(y_true, y_pred)
+        medae = median_absolute_error(y_true, y_pred)
+        mape = mean_absolute_percentage_error(y_true, y_pred)
+        bias = np.nanmean(y_pred-y_true)
+    return mae, medae, mape, ccc, r2, bias
 
 
-def run_cumusort(data, tgt, prop, output_folder, weights_feature=None, threshold_step=0.001):
+def run_cumusort(data, tgt, prop, space, output_folder, weights_feature=None, threshold_step=0.001):
     covs_all = read_features(f'/home/opengeohub/xuemeng/work_xuemeng/soc/SOC-EU/features/001_covar_all.txt')
     data = data.dropna(subset=covs_all,how='any')
     n_bootstrap=20
@@ -271,54 +282,85 @@ def run_cumusort(data, tgt, prop, output_folder, weights_feature=None, threshold
         y_pred = cross_val_predict(rf, data[current_features], data[tgt], cv=group_kfold, groups=groups, n_jobs=-1)
         y_true = data[tgt]
 
-        metrics = calc_metrics(y_true, y_pred)
+        metrics = calc_metrics(y_true, y_pred, space)
         results.append((threshold, len(current_features), *metrics))
     
-    results_df = pd.DataFrame(results, columns=['Threshold', 'Num_Features', 'CCC', 'RMSE', 'R2'])
-
-    # plot feature elimination analysis
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    color = 'tab:blue'
-    ax1.set_xlabel('Feature Importance Threshold', fontsize=16)
-    ax1.set_ylabel('Number of Features', color=color, fontsize=16)
-    ax1.plot(results_df['Threshold'], results_df['Num_Features'], color=color, marker='o', label='Num_Features')
-    ax1.tick_params(axis='y', labelcolor=color, labelsize=14)
-    ax1.tick_params(axis='x', labelsize=14)
-    ax2 = ax1.twinx()
-    color = 'tab:red'
-    ax2.set_ylabel('Evaluation Metrics', color=color, fontsize=16)
-    ax2.plot(results_df['Threshold'], results_df['CCC'], color='tab:green', marker='x', label='CCC')
-    ax2.plot(results_df['Threshold'], results_df['RMSE'], color='tab:orange', marker='^', label='RMSE')
-    ax2.plot(results_df['Threshold'], results_df['R2'], color='tab:red', marker='s', label='R2')
-    ax2.tick_params(axis='y', labelcolor=color, labelsize=14)
-    fig.tight_layout() 
-    ax1.legend(loc='upper left', fontsize=14)
-    ax2.legend(loc='upper right', fontsize=14)
-    plt.title('Feature Elimination Analysis', fontsize=16)
-    plt.savefig(f'{output_folder}/plot_feature.elimination_{prop}.pdf')
-    plt.show()
-    
+    results_df = pd.DataFrame(results, columns=['Threshold', 'Num_Features', 'MAE', 'MedAE', 'MAPE', 'CCC', 'R2','bias'])
+    results_df['MAE_Rank'] = results_df['MAE'].rank(ascending=True)
+    results_df['MAPE_Rank'] = results_df['MAPE'].rank(ascending=True)
+    results_df['MedAE_Rank'] = results_df['MedAE'].rank(ascending=True)
+    results_df['bias_Rank'] = results_df['bias'].rank(ascending=True)
     results_df['CCC_Rank'] = results_df['CCC'].rank(ascending=False)
-    results_df['RMSE_Rank'] = results_df['RMSE'].rank(ascending=True)
     results_df['R2_Rank'] = results_df['R2'].rank(ascending=False)
-    results_df['Combined_Rank'] = results_df['CCC_Rank'] + results_df['RMSE_Rank'] + results_df['R2_Rank']
+    results_df['Combined_Rank'] = results_df['MAE_Rank'] + results_df['CCC_Rank'] + results_df['R2_Rank'] + results_df['MedAE_Rank']
+    
+    # select threshold
     results_df = results_df.sort_values(by='Combined_Rank')
     results_df.to_csv(f'{output_folder}/metrics.rank_feature.elimination_{prop}.csv', index=False)
-    best_threshold = None
+    best_threshold = results_df.loc[results_df['Combined_Rank'].idxmin(), 'Threshold']
 
     for index, row in results_df.iterrows():
         if row['Num_Features'] < 100:
-            best_threshold = row['Threshold']
+            selected_threshold = row['Threshold']
             break
-
-    features_df = sorted_importances[sorted_importances['Mean Cumulative Feature Importance'] >= best_threshold]
+           
+    features_df = sorted_importances[sorted_importances['Mean Cumulative Feature Importance'] >= selected_threshold]
     covs = features_df['Feature Name'].tolist()
     if 'hzn_dep' not in covs:
+        print(f'{prop} model did not select depth as covs, adding it')
         covs.append('hzn_dep')
-    print(f'--------------{len(covs)} features selected for {prop}, mean cumulative feature importance threshold: {best_threshold}---------')
+    print(f'--------------{len(covs)} features selected for {prop}, mean cumulative feature importance threshold: {selected_threshold}---------')
     with open(f'{output_folder}/benchmark_selected.covs_{prop}.txt', 'w') as file:
         for item in covs:
             file.write(f"{item}\n")
+        
+    results_df = results_df.sort_values(by='Threshold')
+    # plot feature elimination analysis
+    fig, ax1 = plt.subplots(figsize=(11, 6))
+    color = 'tab:blue'
+    ax1.set_xlabel('Feature Importance Threshold', fontsize=16)
+    ax1.set_ylabel('Number of Features', color=color, fontsize=16)
+    line1 = ax1.plot(results_df['Threshold'], results_df['Num_Features'], color=color, marker='o', label='Num_Feat')
+    ax1.tick_params(axis='y', labelcolor=color, labelsize=14)
+    ax1.tick_params(axis='x', labelsize=14)
+
+    ax2 = ax1.twinx()
+    color = 'tab:red'
+    ax2.set_ylabel('Evaluation Metrics', color=color, fontsize=16)
+    line2 = ax2.plot(results_df['Threshold'], results_df['CCC'], color='tab:green', marker='x', linestyle='-', linewidth=2, label='CCC')
+    line3 = ax2.plot(results_df['Threshold'], results_df['R2'], color='tab:red', marker='s', linestyle='-', linewidth=2, label='R2')
+    line4 = ax2.plot(results_df['Threshold'], results_df['MAE']/10, color='tab:orange', marker='^', linestyle='-', linewidth=2, label='MAE (scaled by 0.1)')
+    # line5 = ax2.plot(results_df['Threshold'], results_df['MAPE'], color='tab:purple', marker='d', linestyle='-', linewidth=2, label='MAPE')
+
+    ax2.tick_params(axis='y', labelcolor=color, labelsize=14)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust layout to avoid cutting off the title
+
+    # Combine legends
+    lines = line1 + line2 + line3 + line4 #+ line5
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper left', bbox_to_anchor=(0.15, 0.95), fontsize=14, framealpha=0.5)
+
+    # Best combined rank
+    best_combined_rank_index = results_df['Combined_Rank'].idxmin()
+    best_threshold = results_df.loc[best_combined_rank_index, 'Threshold']
+    best_num_features = results_df.loc[best_combined_rank_index, 'Num_Features']
+
+    # Vertical line for the best and selected threshold
+    ax1.axvline(x=best_threshold, color='grey', linestyle='--', label='Best Threshold')
+    ax1.axvline(x=selected_threshold, color='cyan', linestyle='--', label='Selected Threshold')
+    
+    # Update the legend to include the vertical line label
+    lines += [ax1.axvline(x=best_threshold, color='grey', linestyle='--')]
+    labels += ['Best Threshold']
+    lines += [ax1.axvline(x=selected_threshold, color='cyan', linestyle='--')]
+    labels += ['Selected Threshold']
+    ax1.legend(lines, labels, loc='upper right', fontsize=14, framealpha=0.5)#, bbox_to_anchor=(0.15, 0.95)
+
+    plt.title(f'{prop}, {best_num_features} features', fontsize=16)
+    plt.savefig(f'{output_folder}/plot_feature.elimination_{prop}.pdf')
+    plt.show()
+    
     return covs
 
     
@@ -332,11 +374,12 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder):
     cv = GroupKFold(n_splits=5)
     ccc_scorer = make_scorer(calc_ccc, greater_is_better=True)
     fitting_score = ccc_scorer
-    ## no weights version
-    # random forest
-    ttprint('----------------------rf------------------------')
+    
+    # ## no weights version
+    # # random forest
+    # ttprint('----------------------rf------------------------')
     param_rf = {
-        'n_estimators': [60, 80, 100],
+        'n_estimators': [64],
         "criterion": [ 'squared_error', 'absolute_error', 'poisson', 'friedman_mse'],
         'max_depth': [10, 20, 30],
         'max_features': [0.3, 0.5, 0.7, 'log2', 'sqrt'],
@@ -352,12 +395,12 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder):
         verbose=1,
         random_state = 1992
     )
-    tune_rf.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
-    warnings.filterwarnings('ignore')
-    rf = tune_rf.best_estimator_
-    joblib.dump(rf, f'{output_folder}/model_rf.{prop}_ccc.joblib')
-    models.append(rf)
-    model_names.append('rf')
+    # tune_rf.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
+    # warnings.filterwarnings('ignore')
+    # rf = tune_rf.best_estimator_
+    # joblib.dump(rf, f'{output_folder}/model_rf.{prop}_ccc.joblib')
+    # models.append(rf)
+    # model_names.append('rf')
 
 #     # simple ANN
 #     ttprint('----------------------ann------------------------')
@@ -373,7 +416,7 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder):
 #         'mlp__alpha': [0.0001, 0.001, 0.01],  # regularization to prevent overfitting
 #         'mlp__learning_rate': ['constant', 'adaptive'],  # how aggressive the weights update
 #         'mlp__learning_rate_init': [0.001, 0.01]  # initial learning rate
-        
+
 #     }
 #     tune_ann = HalvingGridSearchCV(
 #         estimator=pipeline,
@@ -390,45 +433,45 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder):
 #     models.append(ann)
 #     model_names.append('ann')
 
-    # # # lightGBR
-    # import lightgbm as lgb
-    # ttprint('----------------------lightGBM------------------------')
-    # def clean_feature_names(df):
-    #     df.columns = [col.replace('{', '').replace('}', '').replace(':', '').replace(',', '').replace('"', '') for col in df.columns]
-    #     return df
-    # from sklearn.preprocessing import FunctionTransformer
-    # clean_names_transformer = FunctionTransformer(clean_feature_names, validate=False)
-    # pipeline = Pipeline([
-    #     ('clean_names', clean_names_transformer),  # Clean feature names
-    #     ('lgbm', lgb.LGBMRegressor(random_state=35,verbose=-1))         # Replace with any model you intend to use
-    # ])
-    # param_lgb = {
-    #     'lgbm__n_estimators': [80, 100, 120],  # Lower initial values for quicker testing
-    #     'lgbm__max_depth': [3, 5, 7],  # Lower maximum depths
-    #     'lgbm__num_leaves': [20, 31, 40],  # Significantly fewer leaves
-    #     'lgbm__learning_rate': [0.01, 0.05, 0.1],  # Fine as is, covers a good range
-    #     'lgbm__min_child_samples': [20, 30, 50],  # Much lower values to accommodate small data sets
-    #     'lgbm__subsample': [0.8, 1.0],  # Reduced range, focusing on higher subsampling
-    #     'lgbm__colsample_bytree': [0.8, 1.0],  # Less variation, focus on higher values
-    #     'lgbm__verbosity': [-1]
-    # }
-    # tune_lgb = HalvingGridSearchCV(
-    #     estimator=pipeline,
-    #     param_grid=param_lgb,
-    #     scoring=fitting_score,
-    #     n_jobs=90,
-    #     cv=cv,
-    #     verbose=1,
-    #     random_state=1994
-    # )
-    # tune_lgb.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
-    # lgbmd = tune_lgb.best_estimator_
-    # joblib.dump(lgbmd, f'{output_folder}/model_lgb.{prop}_ccc.joblib')
-    # models.append(lgbmd)
-    # model_names.append('lgb')
+#     # # lightGBR
+#     import lightgbm as lgb
+#     ttprint('----------------------lightGBM------------------------')
+#     def clean_feature_names(df):
+#         df.columns = [col.replace('{', '').replace('}', '').replace(':', '').replace(',', '').replace('"', '') for col in df.columns]
+#         return df
+#     from sklearn.preprocessing import FunctionTransformer
+#     clean_names_transformer = FunctionTransformer(clean_feature_names, validate=False)
+#     pipeline = Pipeline([
+#         ('clean_names', clean_names_transformer),  # Clean feature names
+#         ('lgbm', lgb.LGBMRegressor(random_state=35,verbose=-1))         # Replace with any model you intend to use
+#     ])
+#     param_lgb = {
+#         'lgbm__n_estimators': [80, 100, 120],  # Lower initial values for quicker testing
+#         'lgbm__max_depth': [3, 5, 7],  # Lower maximum depths
+#         'lgbm__num_leaves': [20, 31, 40],  # Significantly fewer leaves
+#         'lgbm__learning_rate': [0.01, 0.05, 0.1],  # Fine as is, covers a good range
+#         'lgbm__min_child_samples': [20, 30, 50],  # Much lower values to accommodate small data sets
+#         'lgbm__subsample': [0.8, 1.0],  # Reduced range, focusing on higher subsampling
+#         'lgbm__colsample_bytree': [0.8, 1.0],  # Less variation, focus on higher values
+#         'lgbm__verbosity': [-1]
+#     }
+#     tune_lgb = HalvingGridSearchCV(
+#         estimator=pipeline,
+#         param_grid=param_lgb,
+#         scoring=fitting_score,
+#         n_jobs=90,
+#         cv=cv,
+#         verbose=1,
+#         random_state=1994
+#     )
+#     tune_lgb.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
+#     lgbmd = tune_lgb.best_estimator_
+#     joblib.dump(lgbmd, f'{output_folder}/model_lgb.{prop}_ccc.joblib')
+#     models.append(lgbmd)
+#     model_names.append('lgb')
     
     # ## weighted version
-    sample_weights = cal[f'{prop}_qa'].values**2
+    sample_weights = cal[f'{prop}_qa'].values #**2
     ttprint('----------------------weighted rf------------------------')
     # random forest
     tune_rf.fit(cal[covs], cal[tgt], sample_weight=sample_weights, groups=cal[spatial_cv_column])
@@ -448,21 +491,26 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder):
     return models, model_names
     
     
-def evaluate_model(models,model_name,train,test,covs,tgt,prop):
+def evaluate_model(models,model_names,train,covs,prop,space,output_folder,test=None):
+    # set target variable
+    if space=='log1p':
+        tgt = f'{prop}_log1p'
+    else:
+        tgt = prop
+        
     # cv, test
     train = train.dropna(subset=covs,how='any')
-    test = test.dropna(subset=covs,how='any')
     
     sample_weights = train[f'{prop}_qa'].values**2
     results = []
     show_low = math.floor(train[tgt].min())
     show_high = math.ceil(train[tgt].max())
-
+    cv = GroupKFold(n_splits=5) 
     for im in range(len(models)):
         model_name = model_names[im]
         model = models[im]
-        figure_name = prop+'.'+model_name
-        print(figure_name)
+        figure_name = model_name
+        ttprint(figure_name)
         fit_params = {}
         # Determine the last step name early if it's a pipeline
         if hasattr(model, 'named_steps'):
@@ -471,56 +519,61 @@ def evaluate_model(models,model_name,train,test,covs,tgt,prop):
                 fit_params = {f'{last_step_name}__sample_weight': sample_weights}
         elif 'weighted' in model_name:
             fit_params = {'sample_weight': sample_weights}
+            
         
         start_time = time.time()
-        y_pred_cv = cross_val_predict(model, train[covs], train[tgt], cv=cv, groups=train[spatial_cv_column], n_jobs=90, fit_params=fit_params)
+        y_pred_cv = cross_val_predict(model, train[covs], train[tgt], cv=cv, groups=train['tile_id'], n_jobs=90, fit_params=fit_params)
         end_time = time.time()
         cv_time = (end_time - start_time)
-        r2_cv, rmse_cv, ccc_cv = accuracy_plot(train[tgt], y_pred_cv, figure_name+ '-cv', output_folder=output_folder, show_range = [show_low, show_high], vmax=20) # visuliazation
+        r2_cv, mae_cv, ccc_cv = accuracy_plot(train[tgt], y_pred_cv, space, figure_name+ '-cv', output_folder=output_folder, show_range = [show_low, show_high], vmax=20) 
         
-        start_time = time.time()
-        model.fit(train[covs], train[tgt], **fit_params)
-        y_pred_val = model.predict(test[covs])
-        end_time = time.time()
-        testing_time = (end_time - start_time)
-        r2_val, rmse_val, ccc_val = accuracy_plot(test[tgt], y_pred_val, figure_name+ '-test', output_folder=output_folder,show_range = [show_low, show_high], vmax=5) # visuliazation
-        error_spatial_plot(test[tgt], y_pred_val, test['lat'], test['lon'], figure_name+ '-test', output_folder=output_folder)
-        sorted_plot(test[tgt],y_pred_val, figure_name+ '-test', output_folder=output_folder)
-        
+        if test is not None:
+            test = test.dropna(subset=covs,how='any')
+            start_time = time.time()
+            model.fit(train[covs], train[tgt], **fit_params)
+            y_pred_val = model.predict(test[covs])
+            end_time = time.time()
+            testing_time = (end_time - start_time)
+            r2_val, mae_val, ccc_val = accuracy_plot(test[tgt], y_pred_val, figure_name+ '-test', output_folder=output_folder,show_range = [show_low, show_high], vmax=5) 
+            error_spatial_plot(test[tgt], y_pred_val, test['lat'], test['lon'], figure_name+ '-test', output_folder=output_folder)
+            sorted_plot(test[tgt],y_pred_val, figure_name+ '-test', output_folder=output_folder)
+
         # store the metrics
         results.append({
             'title': model_name,
-            'R2_val': r2_val,
-            'RMSE_val': rmse_val,
-            'CCC_val': ccc_val,
             'R2_cv': r2_cv,
-            'RMSE_cv': rmse_cv,
+            'MAE_cv': mae_cv,
             'CCC_cv': ccc_cv,
+            # 'R2_val': r2_val,
+            # 'MAE_val': mae_val,
+            # 'CCC_val': ccc_val,
             'cv_time (s)': cv_time,
-            'test_time (s)': testing_time
+            # 'test_time (s)': testing_time
         })
         
-        # store feature importance
-        if hasattr(model, 'named_steps'):  # Check if it's a pipeline
-            last_step = model.named_steps[last_step_name]
-            if hasattr(last_step, 'feature_importances_'):
-                importances = last_step.feature_importances_
-        elif hasattr(model, 'feature_importances_'):  # Direct model
-            importances = model.feature_importances_
-        else:
-            importances = [0] * len(covs)  # Default to zero if no importances are available
+#         # store feature importance
+#         if hasattr(model, 'named_steps'):  # Check if it's a pipeline
+#             last_step = model.named_steps[last_step_name]
+#             if hasattr(last_step, 'feature_importances_'):
+#                 importances = last_step.feature_importances_
+#         elif hasattr(model, 'feature_importances_'):  # Direct model
+#             importances = model.feature_importances_
+#         else:
+#             importances = [0] * len(covs)  # Default to zero if no importances are available
 
-        feature_importance_df = pd.DataFrame({
-            'feature': covs,
-            'importance': importances
-        })
-        sorted_feature_importance_df = feature_importance_df.sort_values(by='importance', ascending=False)
-        sorted_feature_importance_df.to_csv(f'{output_folder}/feature.importances_{prop}_{model_name}.txt', index=False, sep='\t')
+#         feature_importance_df = pd.DataFrame({
+#             'feature': covs,
+#             'importance': importances
+#         })
+#         sorted_feature_importance_df = feature_importance_df.sort_values(by='importance', ascending=False)
+        # sorted_feature_importance_df.to_csv(f'{output_folder}/feature.importances_{prop}_{model_name}.txt', index=False, sep='\t')
           
     results = pd.DataFrame(results)
     results.to_csv(f'{output_folder}/benchmark_metrics_{prop}.csv',index=False)
     return results
-    
+
+
+
 def separate_data(prop, filt, space, output_folder, df): 
     # df = pd.read_csv(f'/home/opengeohub/xuemeng/work_xuemeng/soc/data/002_data_whole.csv',low_memory=False) 
     os.makedirs(output_folder, exist_ok=True)
@@ -547,13 +600,16 @@ def separate_data(prop, filt, space, output_folder, df):
     cal_train = df.loc[~df['id'].isin(idl)] # calibration and train
     # get 10% of training data as calibration for parameter fine tuning and feature selection
     cal_train.reset_index(drop=True, inplace=True)
-    cal = cal_train.groupby('tile_id', group_keys=False).apply(lambda x: x.sample(n=max(1, int(np.ceil(0.2 * len(x))))))
+    cal = cal_train.groupby('tile_id', group_keys=False).apply(lambda x: x.sample(n=max(1, int(np.ceil(0.16 * len(x))))))
     # the rest as training dataset
     train = cal_train.drop(cal.index)
     # if test_size>0:
     #     test = test.iloc[0:round(len(test)*test_size)]
     #     train = train.iloc[0:round(len(train)*test_size)]
     #     cal = cal.iloc[0:round(len(cal)*test_size)]
+    print(f'calibration size {len(cal)}, training size {len(train)}, test size {len(test)}')
+    print(f'sum {len(cal)+len(train)+len(test)}, df {len(df)}')
+    print(f'ratio cal:trai - {len(cal)/len(train):.2f}')
     cal.to_csv(f'{output_folder}/benchmark_cal.pnts_{prop}.csv',index=False)
     train.to_csv(f'{output_folder}/benchmark_train.pnts_{prop}.csv',index=False)
     test.to_csv(f'{output_folder}/benchmark_test.pnts_{prop}.csv',index=False)
@@ -581,7 +637,6 @@ def run_benchmark(folder,output_folder,space,prop,filt,test_size=0):
     
 
 
-
 def calc_picp(lower_bounds, upper_bounds, true_values):
     within_bounds = np.sum((true_values >= lower_bounds) & (true_values <= upper_bounds))
     picp = within_bounds / len(true_values)
@@ -590,15 +645,13 @@ def calc_picp(lower_bounds, upper_bounds, true_values):
 def calc_qcp(predictions, true_values, quantile):
     return np.mean(true_values <= predictions)
 
-def quantile_cross_val_predict(estimator, X, y, cv, quantiles, groups=None, return_point_predictions=False):
+def quantile_cross_val_predict(estimator, X, y, cv, quantiles, groups=None):
     """ Custom cross-validation to handle quantile predictions with group support. """
-    all_quantile_predictions = []
-    all_point_predictions = []
-
+    predictions = {q: [] for q in quantiles}
     if groups is None:
-        cv_split = cv.split(X, random_state=42)
+        cv_split = cv.split(X)
     else:
-        cv_split = cv.split(X, y, groups, random_state=42)
+        cv_split = cv.split(X, y, groups)
     
     for train_idx, test_idx in cv_split:
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -607,23 +660,12 @@ def quantile_cross_val_predict(estimator, X, y, cv, quantiles, groups=None, retu
         # Fit the model on the training data
         estimator.fit(X_train, y_train)
         
-        # Predict quantiles and collect results
-        if return_point_predictions:
-            point_preds, quantile_preds = estimator.predict(X_test, quantiles=quantiles, return_point_predictions=True)
-            all_point_predictions.append(point_preds)
-        else:
-            quantile_preds = estimator.predict(X_test, quantiles=quantiles)
-        
-        all_quantile_predictions.append(quantile_preds)
+        # Predict each quantile and store results
+        for q in quantiles:
+            pred = estimator.predict(X_test, quantiles=q)
+            predictions[q].extend(pred)
     
-    # Concatenate all the predictions along the first axis (rows)
-    all_quantile_predictions = np.vstack(all_quantile_predictions)
-    
-    if return_point_predictions:
-        all_point_predictions = np.concatenate(all_point_predictions)
-        return all_point_predictions, all_quantile_predictions
-    else:
-        return all_quantile_predictions
+    return predictions
 
 
 
